@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: phpmyadmin
+    restart: always
+    environment:
+      PMA_HOST: host.docker.internal
+      PMA_USER: root
+      PMA_PASSWORD: your_mysql_root_password
+    ports:
+      - "8080:80"
+    networks:
+      - trach-network
+
+  trach-phim-backend:
+    build: .
+    container_name: trach-phim-backend
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      - DBMS_CONNECTION=jdbc:mysql://host.docker.internal:3306/trach-phim
+      - DBMS_USERNAME=your_mysql_user
+      - DBMS_PASSWORD=your_mysql_password
+      - JWT_SECRET=1TjXchw5FloESb63Kc+DFhTARvpWL4jUGCwfGWxuG5SIf/1y/LgJxHnMqaF6A/ij
+    networks:
+      - trach-network
+
+networks:
+  trach-network:
+    driver: bridge
