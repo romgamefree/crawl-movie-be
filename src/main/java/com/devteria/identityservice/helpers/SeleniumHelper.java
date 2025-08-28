@@ -73,8 +73,8 @@ public class SeleniumHelper {
                 return "complete".equals(readyState);
             });
 
-            // Chờ thêm 2 giây để JavaScript load hoàn toàn
-            Thread.sleep(2000);
+            // Chờ thêm .8 giây để JavaScript load hoàn toàn
+            Thread.sleep(800);
 
             // Lấy HTML sau khi JavaScript đã render
             String html = driver.getPageSource();

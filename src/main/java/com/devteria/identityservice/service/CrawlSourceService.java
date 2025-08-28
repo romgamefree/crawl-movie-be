@@ -1394,7 +1394,7 @@ public class CrawlSourceService {
 
             log.info("Đang truy cập: {} để xử lý subtitle/budding buttons", baseUrl);
             driver.get(baseUrl);
-            Thread.sleep(3000);
+            Thread.sleep(200);
 
             // Xử lý subtitle button
             String subtitleButtonSelector = extractedData.get(SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
@@ -1770,7 +1770,8 @@ public class CrawlSourceService {
             }
             
             // Download file
-            URL fileUrl = new URL(url);
+            String encoded = java.net.URI.create(url).toASCIIString();
+            URL fileUrl = new URL(encoded);
             try (InputStream in = fileUrl.openStream();
                  FileOutputStream out = new FileOutputStream(localPath)) {
                 
