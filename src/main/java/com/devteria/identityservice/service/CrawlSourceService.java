@@ -160,6 +160,7 @@ public class CrawlSourceService {
 
         log.info("🚀 Bắt đầu crawl dữ liệu từ URL: {}", baseUrl);
 
+        WebDriver driver = null;
         try {
             // Luôn render bằng JavaScript để lấy dữ liệu đầy đủ
             log.info("⚡ Luôn render bằng JavaScript để lấy dữ liệu đầy đủ");
@@ -173,8 +174,6 @@ public class CrawlSourceService {
                 extractedData = new HashMap<>(jsExtractedData);
                 finalDoc = jsDoc;
                 log.info("✅ Đã extract dữ liệu từ JavaScript rendering");
-
-                // Không fallback: yêu cầu luôn render JS
             } else {
                 // Không render được JS -> coi là lỗi
                 log.error("❌ Không thể render JavaScript cho URL: {}", baseUrl);
@@ -202,8 +201,17 @@ public class CrawlSourceService {
             // Tạo hoặc tìm Movie
             Movie movie = findOrCreateMovie(extractedData, finalDoc, baseUrl, titleQuery, titleAttribute);
 
-            // Lưu các entity liên quan
-            saveRelatedEntities(movie, extractedData, baseUrl);
+            // Khởi tạo 1 phiên Selenium để xử lý các thao tác DOM (subtitle/budding)
+            driver = createHeadlessDriver();
+            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
+            ((JavascriptExecutor) driver).executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+            log.info("Đang truy cập bằng Selenium: {}", baseUrl);
+            driver.get(baseUrl);
+            // Chờ trang ổn định
+            wait.until(ExpectedConditions.presenceOfElementLocated(By.cssSelector("body")));
+
+            // Lưu các entity liên quan (truyền thêm selectorItems, driver, finalDoc)
+            saveRelatedEntities(movie, extractedData, baseUrl, selectorItems, driver, finalDoc);
 
             // Đánh dấu đã insert thành công
             crawlSource.setInserted(true);
@@ -216,6 +224,12 @@ public class CrawlSourceService {
         } catch (Exception e) {
             log.error("❌ Lỗi khi crawl dữ liệu từ URL {}: {}", baseUrl, e.getMessage(), e);
             throw new AppException(ErrorCode.DATA_NOT_FOUND);
+        } finally {
+            if (driver != null) {
+                try {
+                    driver.quit();
+                } catch (Exception ignore) {}
+            }
         }
     }
 
@@ -256,10 +270,6 @@ public class CrawlSourceService {
 
                 MovieResponse movieResponse = insertFromCrawlSource(crawlSourceId, force);
                 successCount++;
-
-                // Đánh dấu đã insert thành công
-                crawlSource.setInserted(true);
-                repository.save(crawlSource);
 
                 log.info("✅ Thành công: ID {} -> {}", crawlSourceId, movieResponse.getTitle());
 
@@ -1526,7 +1536,7 @@ public class CrawlSourceService {
         }
 
         // Tạo server data cơ bản
-        createServerDataForEpisode(episode, movie, extractedData, videoUrl, "basic");
+        createServerDataForEpisode(episode, movie, extractedData, videoUrl, episodeServerName);
     }
 
     /**
@@ -1551,7 +1561,7 @@ public class CrawlSourceService {
         }
         
         // Tạo slug dựa trên server type
-        String sdSlug = StringUtils.generateSlug(sdTitle) + "-" + serverType;
+        String sdSlug = StringUtils.generateSlug(sdTitle) + "-" + StringUtils.generateSlug(serverType);
 
         // Kiểm tra server data đã tồn tại chưa
         ServerData serverData = null;
@@ -1606,46 +1616,25 @@ public class CrawlSourceService {
     /**
      * Extract server name từ page sau khi click button
      */
-    private String extractServerNameFromPage(WebDriver driver, Map<String, String> extractedData) {
+    private String extractServerNameFromPage(WebDriver driver, Set<SelectorItem> selectorItems) {
         try {
-            // Thử extract từ EPISODE_SERVER_NAME selector
-            String serverNameSelector = extractedData.get(SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
-            if (serverNameSelector != null && !serverNameSelector.isBlank()) {
+            SelectorItem serverNameSel = getSelectorByName(selectorItems, SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
+            if (serverNameSel != null && serverNameSel.getQuery() != null && !serverNameSel.getQuery().isBlank()) {
                 try {
-                    WebElement serverNameElement = driver.findElement(By.cssSelector(serverNameSelector));
-                    String serverName = serverNameElement.getText();
-                    if (serverName != null && !serverName.isBlank()) {
-                        return serverName.trim();
+                    WebElement el = driver.findElement(By.cssSelector(serverNameSel.getQuery()));
+                    String text = (serverNameSel.getAttribute() != null && !serverNameSel.getAttribute().isBlank())
+                            ? el.getAttribute(serverNameSel.getAttribute())
+                            : el.getText();
+                    if (text != null && !text.isBlank()) {
+                        return text.trim();
                     }
                 } catch (Exception e) {
                     log.debug("Không thể extract server name từ selector: {}", e.getMessage());
                 }
             }
-            
-            // Fallback: tìm các element có thể chứa server name
-            String[] fallbackSelectors = {
-                "[class*='server']", "[class*='episode']", "[class*='player']",
-                ".server-name", ".episode-name", ".player-name"
-            };
-            
-            for (String selector : fallbackSelectors) {
-                try {
-                    List<WebElement> elements = driver.findElements(By.cssSelector(selector));
-                    for (WebElement element : elements) {
-                        String text = element.getText();
-                        if (text != null && !text.isBlank() && text.length() < 100) {
-                            return text.trim();
-                        }
-                    }
-                } catch (Exception e) {
-                    continue;
-                }
-            }
-            
         } catch (Exception e) {
             log.error("Lỗi khi extract server name từ page: {}", e.getMessage());
         }
-        
         return null;
     }
 
@@ -1858,6 +1847,168 @@ public class CrawlSourceService {
         } catch (java.net.URISyntaxException e) {
             log.warn("Không thể parse baseUrl: {}", baseUrl);
             return url;
+        }
+    }
+
+    private void saveRelatedEntities(Movie movie, Map<String, String> extractedData, String baseUrl, Set<SelectorItem> selectorItems, WebDriver driver, Document currentDoc) {
+        // Lưu Actors
+        saveActors(movie, extractedData.get(SelectorMovieDetail.ACTORS.getValue()));
+        // Lưu Categories
+        saveCategories(movie, extractedData.get(SelectorMovieDetail.CATEGORY.getValue()));
+        // Lưu Countries
+        saveCountries(movie, extractedData.get(SelectorMovieDetail.COUNTRIES.getValue()));
+        // Lưu Directors
+        saveDirectors(movie, extractedData.get(SelectorMovieDetail.DIRECTORS.getValue()));
+        // Episodes/ServerData bằng 1 phiên Selenium
+        saveEpisodesAndServerDatas(movie, extractedData, baseUrl, selectorItems, driver, currentDoc);
+    }
+
+    private SelectorItem getSelectorByName(Set<SelectorItem> selectorItems, String name) {
+        if (selectorItems == null || selectorItems.isEmpty() || name == null) return null;
+        for (SelectorItem si : selectorItems) {
+            if (name.equals(si.getName())) return si;
+        }
+        return null;
+    }
+
+    private ChromeDriver createHeadlessDriver() {
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--headless");
+        options.addArguments("--mute-audio");
+        options.addArguments("--disable-audio");
+        options.addArguments("--disable-images");
+        options.addArguments("--disable-blink-features=AutomationControlled");
+        options.addArguments("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        options.addArguments("--disable-web-security");
+        options.addArguments("--allow-running-insecure-content");
+        options.addArguments("--disable-gpu");
+        options.addArguments("--no-sandbox");
+        return new ChromeDriver(options);
+    }
+
+    private void handleButtonClick(WebDriver driver, WebDriverWait wait, Movie movie, Set<SelectorItem> selectorItems, String serverType, String buttonQuery, String baseUrl) {
+        try {
+            log.info("Đang xử lý {} button với selector: {}", serverType, buttonQuery);
+
+            WebElement buttonElement = null;
+            try {
+                buttonElement = wait.until(ExpectedConditions.elementToBeClickable(By.cssSelector(buttonQuery)));
+            } catch (Exception e) {
+                log.error("Không thể tìm thấy button selector {}: {}", buttonQuery, e.getMessage());
+                return;
+            }
+
+            try {
+                buttonElement.click();
+            } catch (Exception e) {
+                ((JavascriptExecutor) driver).executeScript("arguments[0].click();", buttonElement);
+            }
+
+            // Đợi trang thay đổi nội dung embed
+            wait.until(ExpectedConditions.presenceOfElementLocated(By.cssSelector("body")));
+            Thread.sleep(800);
+
+            // Lấy server name sau click từ selector cấu hình
+            String serverName = extractServerNameFromPage(driver, selectorItems);
+            if (serverName == null || serverName.isBlank()) {
+                log.warn("Không tìm thấy server name sau khi click {}");
+                return;
+            }
+
+            // Find/create Episode theo serverName
+            Episode episode = episodeRepository.findByMovieIdAndServerName(movie.getId(), serverName).orElse(null);
+            if (episode == null) {
+                episode = Episode.builder()
+                        .serverName(serverName)
+                        .movie(movie)
+                        .build();
+                episode = episodeRepository.save(episode);
+                log.info("✅ Đã tạo episode mới cho {}: {}", serverType, serverName);
+            }
+
+            // Lấy videoUrl mới từ DOM sau click bằng selector cấu hình VIDEO_URL
+            String newVideoUrl = extractVideoUrlFromPageAfterClick(driver, baseUrl, selectorItems);
+            if (newVideoUrl != null && !newVideoUrl.isBlank()) {
+                createServerDataForEpisode(episode, movie, Collections.emptyMap(), newVideoUrl, serverName);
+            } else {
+                log.warn("Không tìm thấy videoUrl mới sau khi click {} button", serverType);
+            }
+
+        } catch (Exception e) {
+            log.error("Lỗi khi xử lý {} button: {}", serverType, e.getMessage());
+        }
+    }
+
+    private String extractVideoUrlFromPageAfterClick(WebDriver driver, String baseUrl, Set<SelectorItem> selectorItems) {
+        try {
+            String pageSource = driver.getPageSource();
+            Document doc = Jsoup.parse(pageSource, baseUrl);
+
+            SelectorItem videoSel = getSelectorByName(selectorItems, SelectorMovieDetail.VIDEO_URL.getValue());
+            if (videoSel != null && videoSel.getQuery() != null && !videoSel.getQuery().isBlank()) {
+                String newVideoUrl = extractValueFromSelector(doc, videoSel.getQuery(), videoSel.getAttribute(), false, baseUrl);
+                if (newVideoUrl != null && !newVideoUrl.isBlank()) {
+                    log.info("Tìm thấy video URL mới: {}", newVideoUrl);
+                    return newVideoUrl;
+                }
+            }
+            log.warn("Không tìm thấy video URL mới sau khi click button");
+            return null;
+        } catch (Exception e) {
+            log.error("Lỗi khi extract video URL từ page: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    // === Appended overloads for selector-based Selenium flow ===
+    private void saveEpisodesAndServerDatas(Movie movie, Map<String, String> extractedData, String baseUrl, Set<SelectorItem> selectorItems, WebDriver driver, Document currentDoc) {
+        // 1) Lấy videoUrl ban đầu từ DOM bằng selector VIDEO_URL; fallback về extractedData nếu cần
+        String effectiveVideoUrl = null;
+        SelectorItem videoSelector = getSelectorByName(selectorItems, SelectorMovieDetail.VIDEO_URL.getValue());
+        if (videoSelector != null) {
+            try {
+                effectiveVideoUrl = extractValueFromSelector(currentDoc, videoSelector.getQuery(), videoSelector.getAttribute(), false, baseUrl);
+            } catch (Exception ignore) {}
+        }
+        if ((effectiveVideoUrl == null || effectiveVideoUrl.isBlank())) {
+            effectiveVideoUrl = extractedData.get(SelectorMovieDetail.VIDEO_URL.getValue());
+        }
+
+        // 2) Quyết định có handle Selenium hay không dựa trên sự hiện diện trong extractedData
+        String subtitlePresence = extractedData.get(SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
+        String buddingPresence = extractedData.get(SelectorMovieDetail.BUDDING_BUTTON.getValue());
+        boolean shouldHandle = (subtitlePresence != null && !subtitlePresence.isBlank())
+                || (buddingPresence != null && !buddingPresence.isBlank());
+
+        if (shouldHandle) {
+            log.info("Tìm thấy subtitle/budding (theo extractedData), xử lý trong 1 phiên Selenium");
+            handleSubtitleAndBuddhaButtons(movie, selectorItems, baseUrl, driver);
+            return;
+        }
+
+        // 3) Nếu không handle Selenium, tạo episode cơ bản khi có video URL
+        if (effectiveVideoUrl != null && !effectiveVideoUrl.isBlank()) {
+            log.info("Không có subtitle/budding, tạo episode cơ bản từ video URL sẵn có");
+            createBasicEpisode(movie, extractedData, effectiveVideoUrl);
+        }
+    }
+
+    private void handleSubtitleAndBuddhaButtons(Movie movie, Set<SelectorItem> selectorItems, String baseUrl, WebDriver driver) {
+        try {
+            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
+
+            SelectorItem subtitleBtnSel = getSelectorByName(selectorItems, SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
+            if (subtitleBtnSel != null && subtitleBtnSel.getQuery() != null && !subtitleBtnSel.getQuery().isBlank()) {
+                handleButtonClick(driver, wait, movie, selectorItems, "subtitle", subtitleBtnSel.getQuery(), baseUrl);
+            }
+
+            SelectorItem buddingBtnSel = getSelectorByName(selectorItems, SelectorMovieDetail.BUDDING_BUTTON.getValue());
+            if (buddingBtnSel != null && buddingBtnSel.getQuery() != null && !buddingBtnSel.getQuery().isBlank()) {
+                handleButtonClick(driver, wait, movie, selectorItems, "budding", buddingBtnSel.getQuery(), baseUrl);
+            }
+
+        } catch (Exception e) {
+            log.error("Lỗi khi xử lý subtitle/budding buttons: {}", e.getMessage());
         }
     }
 }
