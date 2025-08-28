@@ -27,7 +27,6 @@ public class M3U8DownloadService {
     private final DownloadHelper downloadHelper;
 
     private static final String BASE_SAVE_FOLDER_PLAYLIST = "../../../data/playlist";
-    private static final String BASE_SAVE_FOLDER_IMAGES = "../../../data/images";
     private static final String FOLDER_SEGMENTS = "segments";
     private static final String FILE_MASTER_M3U8 = "master.m3u8";
     private static final String FILE_INDEX_M3U8 = "index.m3u8";

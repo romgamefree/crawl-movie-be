@@ -42,6 +42,11 @@ import org.openqa.selenium.chrome.ChromeOptions;
 import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.URL;
+
 @Service
 @RequiredArgsConstructor
 @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
@@ -70,6 +75,9 @@ public class CrawlSourceService {
     // services
     M3U8DownloadService m3U8DownloadService;
     M3u8Properties m3u8Properties;
+
+    private static final String BASE_SAVE_FOLDER_IMAGES = "../../../data/playlist";
+
 
     public CrawlSourceResponse create(CrawlSourceRequest request) {
         CrawlSource entity = mapper.toEntity(request);
@@ -543,7 +551,8 @@ public class CrawlSourceService {
      */
     private Movie findOrCreateMovie(Map<String, String> extractedData, Document doc, String baseUrl, String titleQuery,
             String titleAttribute) {
-        String thumbnailUrl = extractedData.get(SelectorMovieDetail.THUMBNAIL_URL.getValue());
+        String originalThumbnailUrl = extractedData.get(SelectorMovieDetail.THUMBNAIL_URL.getValue());
+        String originalPosterUrl = extractedData.get(SelectorMovieDetail.POSTER_URL.getValue());
         String title = extractedData.get(SelectorMovieDetail.TITLE.getValue());
 
         // Kiểm tra xem có phải phim bộ không (có bảng sequel)
@@ -562,18 +571,29 @@ public class CrawlSourceService {
                 Optional<Movie> existingByTitle = movieRepository.findByTitle(title);
                 if (existingByTitle.isPresent()) {
                     log.info("🔄 Đã tồn tại movie SERIES theo title: {}", title);
-                    return existingByTitle.get();
+                    Movie movie = existingByTitle.get();
+
+                    // Cập nhật thumbnail/poster theo movieId và tên file gốc
+                    if (originalThumbnailUrl != null && !originalThumbnailUrl.isBlank()) {
+                        String localThumbUrl = downloadAndSaveImageToMovieDir(originalThumbnailUrl, movie.getId());
+                        movie.setThumbnailUrl(localThumbUrl);
+                    }
+                    if (originalPosterUrl != null && !originalPosterUrl.isBlank()) {
+                        String localPosterUrl = downloadAndSaveImageToMovieDir(originalPosterUrl, movie.getId());
+                        movie.setPosterUrl(localPosterUrl);
+                    }
+
+                    movie = movieRepository.save(movie);
+                    return movie;
                 }
             }
 
-            // Tạo movie mới cho phim bộ
+            // Tạo movie mới cho phim bộ (lưu trước để lấy movieId)
             Movie movie = Movie.builder()
                     .title(title != null ? title : "Unknown Series Title")
                     .slug(StringUtils.generateSlug(title))
                     .content(extractedData.get(SelectorMovieDetail.DESCRIPTION.getValue()))
                     .year(parseReleaseYear(extractedData.get(SelectorMovieDetail.RELEASE_YEAR.getValue())))
-                    .thumbnailUrl(thumbnailUrl)
-                    .posterUrl(extractedData.get(SelectorMovieDetail.POSTER_URL.getValue()))
                     .type(MovieType.SERIES)
                     .trailerUrl(extractedData.get(SelectorMovieDetail.TRAILER.getValue()))
                     .status(MovieStatus.ONGOING)
@@ -581,6 +601,18 @@ public class CrawlSourceService {
 
             movie = movieRepository.save(movie);
             log.info("🆕 Tạo movie mới cho phim bộ: {} với type: SERIES", movie.getTitle());
+
+            // Sau khi có movieId, download ảnh với tên gốc vào data/playlist/{movieId}/
+            if (originalThumbnailUrl != null && !originalThumbnailUrl.isBlank()) {
+                String localThumbUrl = downloadAndSaveImageToMovieDir(originalThumbnailUrl, movie.getId());
+                movie.setThumbnailUrl(localThumbUrl);
+            }
+            if (originalPosterUrl != null && !originalPosterUrl.isBlank()) {
+                String localPosterUrl = downloadAndSaveImageToMovieDir(originalPosterUrl, movie.getId());
+                movie.setPosterUrl(localPosterUrl);
+            }
+
+            movie = movieRepository.save(movie);
             return movie;
         } else {
             log.info("🎬 Phát hiện phim lẻ");
@@ -593,11 +625,19 @@ public class CrawlSourceService {
                     movie.setSlug(StringUtils.generateSlug(title));
                     movie.setContent(extractedData.get(SelectorMovieDetail.DESCRIPTION.getValue()));
                     movie.setYear(parseReleaseYear(extractedData.get(SelectorMovieDetail.RELEASE_YEAR.getValue())));
-                    movie.setThumbnailUrl(thumbnailUrl);
-                    movie.setPosterUrl(extractedData.get(SelectorMovieDetail.POSTER_URL.getValue()));
                     movie.setType(MovieType.SINGLE);
                     movie.setTrailerUrl(extractedData.get(SelectorMovieDetail.TRAILER.getValue()));
                     movie.setStatus(MovieStatus.COMPLETED);
+
+                    // Cập nhật thumbnail/poster theo movieId và tên file gốc
+                    if (originalThumbnailUrl != null && !originalThumbnailUrl.isBlank()) {
+                        String localThumbUrl = downloadAndSaveImageToMovieDir(originalThumbnailUrl, movie.getId());
+                        movie.setThumbnailUrl(localThumbUrl);
+                    }
+                    if (originalPosterUrl != null && !originalPosterUrl.isBlank()) {
+                        String localPosterUrl = downloadAndSaveImageToMovieDir(originalPosterUrl, movie.getId());
+                        movie.setPosterUrl(localPosterUrl);
+                    }
 
                     movie = movieRepository.save(movie);
                     log.info("🔄 Cập nhật movie SINGLE theo title: {}", title);
@@ -605,13 +645,12 @@ public class CrawlSourceService {
                 }
             }
 
+            // Tạo movie mới cho phim lẻ (lưu trước để lấy movieId)
             Movie movie = Movie.builder()
                     .title(title != null ? title : "Unknown Title")
                     .slug(StringUtils.generateSlug(title))
                     .content(extractedData.get(SelectorMovieDetail.DESCRIPTION.getValue()))
                     .year(parseReleaseYear(extractedData.get(SelectorMovieDetail.RELEASE_YEAR.getValue())))
-                    .thumbnailUrl(thumbnailUrl)
-                    .posterUrl(extractedData.get(SelectorMovieDetail.POSTER_URL.getValue()))
                     .type(MovieType.SINGLE)
                     .trailerUrl(extractedData.get(SelectorMovieDetail.TRAILER.getValue()))
                     .status(MovieStatus.COMPLETED)
@@ -619,7 +658,78 @@ public class CrawlSourceService {
 
             movie = movieRepository.save(movie);
             log.info("🆕 Tạo movie mới cho phim lẻ: {} với type: SINGLE", movie.getTitle());
+
+            // Sau khi có movieId, download ảnh với tên gốc vào data/playlist/{movieId}/
+            if (originalThumbnailUrl != null && !originalThumbnailUrl.isBlank()) {
+                String localThumbUrl = downloadAndSaveImageToMovieDir(originalThumbnailUrl, movie.getId());
+                movie.setThumbnailUrl(localThumbUrl);
+            }
+            if (originalPosterUrl != null && !originalPosterUrl.isBlank()) {
+                String localPosterUrl = downloadAndSaveImageToMovieDir(originalPosterUrl, movie.getId());
+                movie.setPosterUrl(localPosterUrl);
+            }
+
+            movie = movieRepository.save(movie);
             return movie;
+        }
+    }
+
+    // Lưu ảnh theo tên gốc vào thư mục BASE_SAVE_FOLDER_IMAGES/{movieId}/ và trả về URL public
+    private String downloadAndSaveImageToMovieDir(String originalUrl, String movieId) {
+        if (originalUrl == null || originalUrl.isBlank()) {
+            return null;
+        }
+        try {
+            String fileName = getFileNameFromUrl(originalUrl);
+            if (fileName == null || fileName.isBlank()) {
+                fileName = "image.jpg";
+            }
+            String localPath = BASE_SAVE_FOLDER_IMAGES + "/" + movieId + "/" + fileName;
+
+            downloadFile(originalUrl, localPath);
+
+            String playlistBaseUrl = m3u8Properties.getPlaylistBaseUrl();
+            String normalizedBase = playlistBaseUrl.endsWith("/")
+                    ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1)
+                    : playlistBaseUrl;
+
+            // Chuẩn hoá đường dẫn và tạo URL công khai mong muốn: {base}/{movieId}/{filename}
+            String pathNoDots = localPath.startsWith("../../../") ? localPath.substring(9) : localPath;
+            String relative;
+            if (pathNoDots.startsWith("data/playlist/")) {
+                relative = pathNoDots.substring("data/playlist/".length());
+            } else {
+                relative = pathNoDots;
+            }
+            String localUrl = normalizedBase + "/" + relative;
+            log.info("✅ Đã download và lưu image: {} -> {}", originalUrl, localUrl);
+            return localUrl;
+        } catch (Exception e) {
+            log.error("Lỗi khi download image: {}", e.getMessage());
+            return originalUrl; // Fallback về URL gốc
+        }
+    }
+
+    // Lấy tên file (kèm phần mở rộng) từ URL gốc
+    private String getFileNameFromUrl(String url) {
+        try {
+            java.net.URI uri = new java.net.URI(url);
+            String path = uri.getPath();
+            if (path == null || path.isBlank()) {
+                return null;
+            }
+            String candidate = path.substring(path.lastIndexOf('/') + 1);
+            // Nếu URL không có extension, mặc định jpg
+            if (candidate == null || candidate.isBlank()) {
+                return null;
+            }
+            if (!candidate.contains(".")) {
+                return candidate + ".jpg";
+            }
+            return candidate;
+        } catch (Exception e) {
+            log.warn("Không thể lấy tên file từ URL: {} - {}", url, e.getMessage());
+            return null;
         }
     }
 
@@ -1480,6 +1590,7 @@ public class CrawlSourceService {
                 : playlistBaseUrl;
 
         String linkToStore;
+        
         if (localMasterPath.startsWith("data/playlist/")) {
             String relative = localMasterPath.substring("data/playlist".length());
             linkToStore = normalizedBase + relative;
@@ -1566,6 +1677,126 @@ public class CrawlSourceService {
         } catch (Exception e) {
             log.error("Lỗi khi extract video URL từ page: {}", e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * Download và lưu thumbnail, trả về link local
+     */
+    private String downloadAndSaveThumbnail(String originalUrl, String title, boolean isSeries) {
+        if (originalUrl == null || originalUrl.isBlank()) {
+            log.warn("Không có thumbnail URL để download");
+            return null;
+        }
+        
+        try {
+            // Tạo tên file và đường dẫn local
+            String fileName = StringUtils.generateSlug(title) + "-thumb.jpg";
+            String localPath = buildThumbnailLocalPath(title, isSeries);
+            
+            // Download file
+            downloadFile(originalUrl, localPath);
+            
+            // Trả về link local để lưu vào database
+            String playlistBaseUrl = m3u8Properties.getPlaylistBaseUrl();
+            String normalizedBase = playlistBaseUrl.endsWith("/") 
+                ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1) 
+                : playlistBaseUrl;
+            
+            String relativePath = localPath.replace("data/playlist/", "");
+            String localUrl = normalizedBase + relativePath;
+            
+            log.info("✅ Đã download và lưu thumbnail: {} -> {}", originalUrl, localUrl);
+            return localUrl;
+            
+        } catch (Exception e) {
+            log.error("Lỗi khi download thumbnail: {}", e.getMessage());
+            return originalUrl; // Fallback về URL gốc
+        }
+    }
+
+    /**
+     * Download và lưu poster, trả về link local
+     */
+    private String downloadAndSavePoster(String originalUrl, String title, boolean isSeries) {
+        if (originalUrl == null || originalUrl.isBlank()) {
+            log.warn("Không có poster URL để download");
+            return null;
+        }
+        
+        try {
+            // Tạo tên file và đường dẫn local
+            String fileName = StringUtils.generateSlug(title) + "-poster.jpg";
+            String localPath = buildPosterLocalPath(title, isSeries);
+            
+            // Download file
+            downloadFile(originalUrl, localPath);
+            
+            // Trả về link local để lưu vào database
+            String playlistBaseUrl = m3u8Properties.getPlaylistBaseUrl();
+            String normalizedBase = playlistBaseUrl.endsWith("/") 
+                ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1) 
+                : playlistBaseUrl;
+            
+            String relativePath = localPath.replace("data/playlist/", "");
+            String localUrl = normalizedBase + relativePath;
+            
+            log.info("✅ Đã download và lưu poster: {} -> {}", originalUrl, localUrl);
+            return localUrl;
+            
+        } catch (Exception e) {
+            log.error("Lỗi khi download poster: {}", e.getMessage());
+            return originalUrl; // Fallback về URL gốc
+        }
+    }
+
+    /**
+     * Build đường dẫn local cho thumbnail
+     */
+    private String buildThumbnailLocalPath(String title, boolean isSeries) {
+        String baseDir = isSeries ? "data/playlist/series" : "data/playlist/single";
+        String slug = StringUtils.generateSlug(title);
+        return baseDir + "/" + slug + "/thumb.jpg";
+    }
+
+    /**
+     * Build đường dẫn local cho poster
+     */
+    private String buildPosterLocalPath(String title, boolean isSeries) {
+        String baseDir = isSeries ? "data/playlist/series" : "data/playlist/single";
+        String slug = StringUtils.generateSlug(title);
+        return baseDir + "/" + slug + "/poster.jpg";
+    }
+
+    /**
+     * Download file từ URL về local path
+     */
+    private void downloadFile(String url, String localPath) throws Exception {
+        try {
+            // Tạo thư mục nếu chưa có
+            File file = new File(localPath);
+            File parentDir = file.getParentFile();
+            if (!parentDir.exists()) {
+                parentDir.mkdirs();
+            }
+            
+            // Download file
+            URL fileUrl = new URL(url);
+            try (InputStream in = fileUrl.openStream();
+                 FileOutputStream out = new FileOutputStream(localPath)) {
+                
+                byte[] buffer = new byte[1024];
+                int bytesRead;
+                while ((bytesRead = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, bytesRead);
+                }
+            }
+            
+            log.info("✅ Đã download file: {} -> {}", url, localPath);
+            
+        } catch (Exception e) {
+            log.error("Lỗi khi download file {}: {}", url, e.getMessage());
+            throw e;
         }
     }
 
