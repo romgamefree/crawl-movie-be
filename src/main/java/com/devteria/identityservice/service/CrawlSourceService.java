@@ -18,6 +18,7 @@ import com.devteria.identityservice.helpers.SeleniumHelper;
 import com.devteria.identityservice.mapper.CrawlSourceMapper;
 import com.devteria.identityservice.mapper.MovieMapper;
 import com.devteria.identityservice.repository.*;
+import com.devteria.identityservice.repository.ConfigRepository;
 import com.devteria.identityservice.utils.StringUtils;
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
@@ -27,10 +28,13 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.time.Duration;
@@ -66,6 +70,7 @@ public class CrawlSourceService {
     DirectorRepository directorRepository;
     EpisodeRepository episodeRepository;
     ServerDataRepository serverDataRepository;
+    ConfigRepository configRepository;
 
     // helpers
     HtmlFetcherHelper htmlFetcherHelper;
@@ -77,7 +82,6 @@ public class CrawlSourceService {
     M3u8Properties m3u8Properties;
 
     private static final String BASE_SAVE_FOLDER_IMAGES = "../../../data/playlist";
-
 
     public CrawlSourceResponse create(CrawlSourceRequest request) {
         CrawlSource entity = mapper.toEntity(request);
@@ -204,7 +208,8 @@ public class CrawlSourceService {
             // Khởi tạo 1 phiên Selenium để xử lý các thao tác DOM (subtitle/budding)
             driver = createHeadlessDriver();
             WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
-            ((JavascriptExecutor) driver).executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+            ((JavascriptExecutor) driver)
+                    .executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
             log.info("Đang truy cập bằng Selenium: {}", baseUrl);
             driver.get(baseUrl);
             // Chờ trang ổn định
@@ -228,7 +233,8 @@ public class CrawlSourceService {
             if (driver != null) {
                 try {
                     driver.quit();
-                } catch (Exception ignore) {}
+                } catch (Exception ignore) {
+                }
             }
         }
     }
@@ -316,31 +322,78 @@ public class CrawlSourceService {
      * 
      * @return Thông tin chi tiết về quá trình insert
      */
-    @Transactional
     public BulkInsertResponse insertAllMovies() {
         long startTime = System.currentTimeMillis();
         log.info("🚀 Bắt đầu insert tất cả movies từ crawl sources enabled và chưa insert");
 
-        // Lấy trực tiếp Set<String> IDs thay vì toàn bộ entity
-        Set<String> crawlSourceIds = repository.findEnabledAndNotInsertedIds();
-
-        if (crawlSourceIds.isEmpty()) {
-            log.info("ℹ️ Không có crawl source nào cần xử lý (tất cả đã được insert hoặc bị disable)");
-            return BulkInsertResponse.builder()
-                    .totalSources(0)
-                    .successCount(0)
-                    .errorCount(0)
-                    .errorUrls(new ArrayList<>())
-                    .message("Không có crawl source nào cần xử lý")
-                    .processingTimeMs(0)
-                    .build();
+        // Đọc cấu hình batch size và checkpoint (nếu có) từ ConfigService (fallback mặc định)
+        int batchSize = 200;
+        String checkpointKey = "crawl.lastId";
+        String lastId = null;
+        try {
+            lastId = configRepository.findByKey(checkpointKey).map(com.devteria.identityservice.entity.Config::getValue)
+                    .orElse(null);
+        } catch (Exception ignore) {
         }
 
-        log.info("📊 Tìm thấy {} crawl sources cần xử lý", crawlSourceIds.size());
+        int total = 0;
+        int successCount = 0;
+        int errorCount = 0;
+        int skippedCount = 0;
+        List<String> errorUrls = new ArrayList<>();
 
-        // Gọi method insertFromCrawlSourceIds để xử lý (force = false để bỏ qua
-        // inserted)
-        BulkInsertResponse response = insertFromCrawlSourceIds(new ArrayList<>(crawlSourceIds), false);
+        while (true) {
+            List<String> ids = repository.findEnabledNotInsertedIdsAfter(lastId,
+                    PageRequest.of(0, batchSize));
+            if (ids == null || ids.isEmpty())
+                break;
+
+            total += ids.size();
+            log.info("📦 Đang xử lý batch {} IDs (lastId={})", ids.size(), lastId);
+
+            for (String id : ids) {
+                try {
+                    // transaction vi mô: rely on existing transactional boundaries inside
+                    // insertFromCrawlSource
+                    insertFromCrawlSource(id, false);
+                    successCount++;
+                } catch (AppException ae) {
+                    errorCount++;
+                    errorUrls.add("ID: " + id + " - " + ae.getMessage());
+                } catch (Exception e) {
+                    errorCount++;
+                    errorUrls.add("ID: " + id + " - " + e.getMessage());
+                }
+                lastId = id; // cập nhật checkpoint theo id đã xử lý gần nhất
+            }
+
+            // persist checkpoint
+            try {
+                Config cp = configRepository.findByKey(checkpointKey)
+                        .orElse(Config.builder().key(checkpointKey).build());
+                cp.setValue(lastId);
+                configRepository.save(cp);
+                log.info("📝 Saved checkpoint lastId={}", lastId);
+            } catch (Exception ignore) {
+            }
+        }
+
+        if (total == 0) {
+            log.info("ℹ️ Không có crawl source nào cần xử lý (tất cả đã được insert hoặc bị disable)");
+        } else {
+            log.info("🎉 Hoàn thành xử lý: tổng={}, thành công={}, lỗi={}, bỏ qua={}", total, successCount, errorCount,
+                    skippedCount);
+        }
+
+        BulkInsertResponse response = BulkInsertResponse.builder()
+                .totalSources(total)
+                .successCount(successCount)
+                .errorCount(errorCount)
+                .errorUrls(errorUrls)
+                .message(String.format("Đã xử lý %d crawl sources: %d thành công, %d lỗi, %d bỏ qua", total,
+                        successCount, errorCount, skippedCount))
+                .processingTimeMs(System.currentTimeMillis() - startTime)
+                .build();
 
         long totalProcessingTime = System.currentTimeMillis() - startTime;
 
@@ -515,7 +568,8 @@ public class CrawlSourceService {
     /**
      * Extract giá trị từ một selector cụ thể
      */
-    private String extractValueFromSelector(Document doc, String query, String attribute, Boolean isList, String baseUrl) {
+    private String extractValueFromSelector(Document doc, String query, String attribute, Boolean isList,
+            String baseUrl) {
         if (isList != null && isList) {
             // Xử lý list elements
             Elements elements = doc.select(query);
@@ -684,7 +738,8 @@ public class CrawlSourceService {
         }
     }
 
-    // Lưu ảnh theo tên gốc vào thư mục BASE_SAVE_FOLDER_IMAGES/{movieId}/ và trả về URL public
+    // Lưu ảnh theo tên gốc vào thư mục BASE_SAVE_FOLDER_IMAGES/{movieId}/ và trả về
+    // URL public
     private String downloadAndSaveImageToMovieDir(String originalUrl, String movieId) {
         if (originalUrl == null || originalUrl.isBlank()) {
             return null;
@@ -703,7 +758,8 @@ public class CrawlSourceService {
                     ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1)
                     : playlistBaseUrl;
 
-            // Chuẩn hoá đường dẫn và tạo URL công khai mong muốn: {base}/{movieId}/{filename}
+            // Chuẩn hoá đường dẫn và tạo URL công khai mong muốn:
+            // {base}/{movieId}/{filename}
             String pathNoDots = localPath.startsWith("../../../") ? localPath.substring(9) : localPath;
             String relative;
             if (pathNoDots.startsWith("data/playlist/")) {
@@ -1079,27 +1135,6 @@ public class CrawlSourceService {
     }
 
     /**
-     * Lưu các entity liên quan
-     */
-    private void saveRelatedEntities(Movie movie, Map<String, String> extractedData, String baseUrl) {
-        // Lưu Actors
-        saveActors(movie, extractedData.get(SelectorMovieDetail.ACTORS.getValue()));
-
-        // Lưu Categories
-        saveCategories(movie, extractedData.get(SelectorMovieDetail.CATEGORY.getValue()));
-
-        // Lưu Countries
-        saveCountries(movie, extractedData.get(SelectorMovieDetail.COUNTRIES.getValue()));
-
-        // Lưu Directors
-        saveDirectors(movie, extractedData.get(SelectorMovieDetail.DIRECTORS.getValue()));
-
-        // Lưu Episodes và ServerDatas
-
-        saveEpisodesAndServerDatas(movie, extractedData, baseUrl);
-    }
-
-    /**
      * Lưu Actors
      */
     private void saveActors(Movie movie, String actorsData) {
@@ -1326,23 +1361,46 @@ public class CrawlSourceService {
     /**
      * Lưu Episodes và ServerDatas
      * todo:
-     * kiểm tra có extract data từ SelectorMovieDetail.SUBTITLE_BUTTON và SelectorMovieDetail.BUDDING_BUTTON không
-     * nếu CÓ thì selenium click vô từng cái và cào serverName bằng extract data từ SelectorMovieDetail.EPISODE_SERVER_NAME
-     * tạo server data tương ứng với episode đó với serverName là episodeServerName extracted data từ SelectorMovieDetail.EPISODE_SERVER_NAME
-     * nếu KHÔNG CÓ thì chỉ cần tạo episode với serverName là episodeServerName extracted data từ SelectorMovieDetail.EPISODE_SERVER_NAME và episode từ extractedData.get(SelectorMovieDetail.VIDEO_URL.getValue());
+     * kiểm tra có extract data từ SelectorMovieDetail.SUBTITLE_BUTTON và
+     * SelectorMovieDetail.BUDDING_BUTTON không
+     * nếu CÓ thì selenium click vô từng cái và cào serverName bằng extract data từ
+     * SelectorMovieDetail.EPISODE_SERVER_NAME
+     * tạo server data tương ứng với episode đó với serverName là episodeServerName
+     * extracted data từ SelectorMovieDetail.EPISODE_SERVER_NAME
+     * nếu KHÔNG CÓ thì chỉ cần tạo episode với serverName là episodeServerName
+     * extracted data từ SelectorMovieDetail.EPISODE_SERVER_NAME và episode từ
+     * extractedData.get(SelectorMovieDetail.VIDEO_URL.getValue());
      *
      * mẫu trich xuất kiểm tra có subtitle và budding không
      * <tr>
      *
-     * 	<th class="selectmvbutton lmselect-1" style="width:24.5%; "><span class="halim-btn halim-btn-2 halim-info-1-1 box-shadow2" data-post-id="169359" data-server="1" data-episode="0" data-position="last" data-embed="1" data-type="none" data-title="My Girlfriend is the Man (2025) เมื่อแฟนผมกลายเป็นหนุ่มสุดฮอต style=" cursor:="" pointer;"=""><i class="hl-server2"></i> พากย์ไทย</span></th>
+     * <th class="selectmvbutton lmselect-1" style="width:24.5%; "><span class=
+     * "halim-btn halim-btn-2 halim-info-1-1 box-shadow2" data-post-id="169359"
+     * data-server="1" data-episode="0" data-position="last" data-embed="1"
+     * data-type="none" data-title="My Girlfriend is the Man (2025)
+     * เมื่อแฟนผมกลายเป็นหนุ่มสุดฮอต style=" cursor:="" pointer;"=""><i class=
+     * "hl-server2"></i> พากย์ไทย</span></th>
      * <th class="selectmvbutton lmselect-2" style="width: 24.5%;">
-     * 			<span class="halim-btn halim-btn-2halim-info-2-1 box-shadow2 active" data-post-id="169359" data-server="2" data-episode="0" data-position="" data-embed="0" data-type="none" data-title="My Girlfriend is the Man (2025) เมื่อแฟนผมกลายเป็นหนุ่มสุดฮอต style=" cursor:="" pointer;"=""><i class="hl-server2"></i> ซับไทย</span>
-     * 			</th>
-     * <th class="selectmvbutton" style="width: 24.5%; "><a href=""><span class="halim-btn halim-btn-2 halim-info-1-1 box-shadow2" style="cursor: pointer; color: #ffffff;"><i class="font dir="auto" style="vertical-align: inherit;"><font dir="auto" style="vertical-align: inherit;">&lt; ก่อนหน้า</font></font></span></a></th>
-     * 				<th class="selectmvbutton" style="width: 24.5%; "><a href="https://www.123hdtv.com/my-girlfriend-is-the-man-ep-2"><span class="halim-btn halim-btn-2 halim-info-1-1 box-shadow2" style="cursor: pointer; color: #ffffff;"><i class="font dir="auto" style="vertical-align: inherit;"><font dir="auto" style="vertical-align: inherit;">ถัดไป &gt;</font></font></span></a></th>
-     * 				</tr>
+     * <span class="halim-btn halim-btn-2halim-info-2-1 box-shadow2 active"
+     * data-post-id="169359" data-server="2" data-episode="0" data-position=""
+     * data-embed="0" data-type="none" data-title="My Girlfriend is the Man (2025)
+     * เมื่อแฟนผมกลายเป็นหนุ่มสุดฮอต style=" cursor:="" pointer;"=""><i class=
+     * "hl-server2"></i> ซับไทย</span>
+     * </th>
+     * <th class="selectmvbutton" style="width: 24.5%; "><a href=""><span class=
+     * "halim-btn halim-btn-2 halim-info-1-1 box-shadow2" style="cursor: pointer;
+     * color: #ffffff;"><i class="font dir="auto" style="vertical-align:
+     * inherit;"><font dir="auto" style="vertical-align: inherit;">&lt;
+     * ก่อนหน้า</font></font></span></a></th>
+     * <th class="selectmvbutton" style="width: 24.5%; "><a href=
+     * "https://www.123hdtv.com/my-girlfriend-is-the-man-ep-2"><span class=
+     * "halim-btn halim-btn-2 halim-info-1-1 box-shadow2" style="cursor: pointer;
+     * color: #ffffff;"><i class="font dir="auto" style="vertical-align:
+     * inherit;"><font dir="auto" style="vertical-align: inherit;">ถัดไป
+     * &gt;</font></font></span></a></th>
+     * </tr>
      *
-     * 			nó là các th với 	selectmvbutton lmselect-1 và selectmvbutton lmselect-2 
+     * nó là các th với selectmvbutton lmselect-1 và selectmvbutton lmselect-2
      */
     private void saveEpisodesAndServerDatas(Movie movie, Map<String, String> extractedData, String baseUrl) {
         String videoUrl = extractedData.get(SelectorMovieDetail.VIDEO_URL.getValue());
@@ -1354,12 +1412,12 @@ public class CrawlSourceService {
             String subtitleButtonSelector = extractedData.get(SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
             String buddingButtonSelector = extractedData.get(SelectorMovieDetail.BUDDING_BUTTON.getValue());
 
-            if (subtitleButtonSelector != null && !subtitleButtonSelector.isBlank() || 
-                buddingButtonSelector != null && !buddingButtonSelector.isBlank()) {
-                
+            if (subtitleButtonSelector != null && !subtitleButtonSelector.isBlank() ||
+                    buddingButtonSelector != null && !buddingButtonSelector.isBlank()) {
+
                 log.info("Tìm thấy subtitle/budding buttons, xử lý bằng Selenium...");
                 handleSubtitleAndBuddhaButtons(movie, extractedData, baseUrl);
-                
+
             } else {
                 log.info("Không có subtitle/budding buttons, tạo episode cơ bản...");
                 createBasicEpisode(movie, extractedData, videoUrl);
@@ -1380,7 +1438,8 @@ public class CrawlSourceService {
             options.addArguments("--disable-audio"); // Vô hiệu hóa audio
             options.addArguments("--disable-images"); // Không load hình ảnh để nhanh hơn
             options.addArguments("--disable-blink-features=AutomationControlled");
-            options.addArguments("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            options.addArguments(
+                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
             options.addArguments("--disable-web-security");
             options.addArguments("--allow-running-insecure-content");
             options.addArguments("--disable-gpu");
@@ -1390,7 +1449,8 @@ public class CrawlSourceService {
             WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
 
             // Loại bỏ thuộc tính webdriver
-            ((JavascriptExecutor) driver).executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+            ((JavascriptExecutor) driver)
+                    .executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
 
             log.info("Đang truy cập: {} để xử lý subtitle/budding buttons", baseUrl);
             driver.get(baseUrl);
@@ -1402,7 +1462,7 @@ public class CrawlSourceService {
                 handleButtonClick(driver, wait, movie, extractedData, "subtitle", subtitleButtonSelector, baseUrl);
             }
 
-            // Xử lý budding button  
+            // Xử lý budding button
             String buddingButtonSelector = extractedData.get(SelectorMovieDetail.BUDDING_BUTTON.getValue());
             if (buddingButtonSelector != null && !buddingButtonSelector.isBlank()) {
                 handleButtonClick(driver, wait, movie, extractedData, "budding", buddingButtonSelector, baseUrl);
@@ -1421,38 +1481,39 @@ public class CrawlSourceService {
     /**
      * Xử lý click button và tạo episode/server data
      */
-    private void handleButtonClick(WebDriver driver, WebDriverWait wait, Movie movie, Map<String, String> extractedData, String serverType, String buttonSelector, String baseUrl) {
+    private void handleButtonClick(WebDriver driver, WebDriverWait wait, Movie movie, Map<String, String> extractedData,
+            String serverType, String buttonSelector, String baseUrl) {
         try {
             log.info("Đang xử lý {} button với selector: {}", serverType, buttonSelector);
-            
+
             // Tìm và click vào span bên trong th element
             WebElement thElement = null;
             WebElement spanElement = null;
-            
+
             try {
                 // Tìm th element trước
-                thElement = wait.until(ExpectedConditions.visibilityOfElementLocated(By.cssSelector("budding".equals(serverType)
-                        ? "#content > div > table > tbody > tr > th.selectmvbutton.lmselect-1"
-                        : "#content > div > table > tbody > tr > th.selectmvbutton.lmselect-2")));
-                
+                thElement = wait
+                        .until(ExpectedConditions.visibilityOfElementLocated(By.cssSelector("budding".equals(serverType)
+                                ? "#content > div > table > tbody > tr > th.selectmvbutton.lmselect-1"
+                                : "#content > div > table > tbody > tr > th.selectmvbutton.lmselect-2")));
+
                 // Tìm span bên trong th element
                 spanElement = thElement.findElement(By.cssSelector("span.halim-btn"));
                 log.info("Tìm thấy span element bên trong th");
-                
+
             } catch (Exception e) {
                 log.warn("Không tìm thấy span trong th, thử tìm trực tiếp...");
                 try {
                     // Fallback: tìm span trực tiếp
                     spanElement = wait.until(ExpectedConditions.elementToBeClickable(
-                        By.cssSelector(buttonSelector + " span.halim-btn")
-                    ));
+                            By.cssSelector(buttonSelector + " span.halim-btn")));
                     log.info("Tìm thấy span element trực tiếp");
                 } catch (Exception e2) {
                     log.error("Không thể tìm thấy span element cho {}: {}", serverType, e2.getMessage());
                     return;
                 }
             }
-            
+
             // Click vào span element
             try {
                 log.info("Đang click vào span element cho {}...", serverType);
@@ -1478,17 +1539,19 @@ public class CrawlSourceService {
                     }
                 }
             }
-            
+
             // Đợi page load sau khi click
             log.info("Đang đợi page load sau khi click...");
             Thread.sleep(1000);
 
-            // Extract server name mới từ page sau khi click todo: xoa ham extract server name for page => su dung extractedData.get(SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
+            // Extract server name mới từ page sau khi click todo: xoa ham extract server
+            // name for page => su dung
+            // extractedData.get(SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
             String newServerName = extractedData.get(SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
-            
+
             if (newServerName != null && !newServerName.isBlank()) {
                 log.info("Tìm thấy server name mới cho {}: {}", serverType, newServerName);
-                
+
                 // Tạo episode mới với server name này
                 Episode newEpisode = episodeRepository.findByMovieIdAndServerName(movie.getId(), newServerName)
                         .orElse(null);
@@ -1508,11 +1571,11 @@ public class CrawlSourceService {
                 } else {
                     log.warn("Không tìm thấy videoUrl mới sau khi click {} button", serverType);
                 }
-                
+
             } else {
                 log.warn("Không tìm thấy server name mới cho {}", serverType);
             }
-            
+
         } catch (Exception e) {
             log.error("Lỗi khi xử lý {} button: {}", serverType, e.getMessage());
         }
@@ -1523,7 +1586,7 @@ public class CrawlSourceService {
      */
     private void createBasicEpisode(Movie movie, Map<String, String> extractedData, String videoUrl) {
         String episodeServerName = extractedData.get(SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
-        
+
         // Đảm bảo mỗi episode chỉ có 1 bộ server data riêng
         Episode episode = episodeRepository.findByMovieIdAndServerName(movie.getId(), episodeServerName)
                 .orElse(null);
@@ -1542,10 +1605,11 @@ public class CrawlSourceService {
     /**
      * Tạo server data cho episode
      */
-    private void createServerDataForEpisode(Episode episode, Movie movie, Map<String, String> extractedData, String videoUrl, String serverType) {
+    private void createServerDataForEpisode(Episode episode, Movie movie, Map<String, String> extractedData,
+            String videoUrl, String serverType) {
         String videoEmbedLink;
         String chosenDownloadUrl;
-        
+
         if (videoUrl.contains("player.stream1689")) { // nung2-hdd.com
             videoEmbedLink = videoLinkExtractor.extractVideoLink(videoUrl);
             chosenDownloadUrl = videoEmbedLink;
@@ -1559,7 +1623,7 @@ public class CrawlSourceService {
         if (sdTitle == null || sdTitle.isBlank()) {
             sdTitle = movie.getTitle();
         }
-        
+
         // Tạo slug dựa trên server type
         String sdSlug = StringUtils.generateSlug(sdTitle) + "-" + StringUtils.generateSlug(serverType);
 
@@ -1573,7 +1637,7 @@ public class CrawlSourceService {
                 }
             }
         }
-        
+
         if (serverData == null) {
             serverData = ServerData.builder()
                     .episode(episode)
@@ -1600,7 +1664,7 @@ public class CrawlSourceService {
                 : playlistBaseUrl;
 
         String linkToStore;
-        
+
         if (localMasterPath.startsWith("data/playlist/")) {
             String relative = localMasterPath.substring("data/playlist".length());
             linkToStore = normalizedBase + relative;
@@ -1618,7 +1682,8 @@ public class CrawlSourceService {
      */
     private String extractServerNameFromPage(WebDriver driver, Set<SelectorItem> selectorItems) {
         try {
-            SelectorItem serverNameSel = getSelectorByName(selectorItems, SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
+            SelectorItem serverNameSel = getSelectorByName(selectorItems,
+                    SelectorMovieDetail.EPISODE_SERVER_NAME.getValue());
             if (serverNameSel != null && serverNameSel.getQuery() != null && !serverNameSel.getQuery().isBlank()) {
                 try {
                     WebElement el = driver.findElement(By.cssSelector(serverNameSel.getQuery()));
@@ -1639,30 +1704,31 @@ public class CrawlSourceService {
     }
 
     /**
-     * Extract video URL mới từ page sau khi click button, sử dụng method extractValueFromSelector có sẵn
+     * Extract video URL mới từ page sau khi click button, sử dụng method
+     * extractValueFromSelector có sẵn
      */
     private String extractVideoUrlFromPageAfterClick(WebDriver driver, String baseUrl) {
         try {
             // Lấy page source từ WebDriver
             String pageSource = driver.getPageSource();
-            
+
             // Convert thành Jsoup Document để sử dụng extractValueFromSelector
             Document doc = Jsoup.parse(pageSource, baseUrl);
-            
+
             // todo: khong hardcode
             String videoUrlSelector = ".embed-responsive-item";
             if (videoUrlSelector != null && !videoUrlSelector.isBlank()) {
                 String newVideoUrl = extractValueFromSelector(doc, videoUrlSelector, "src", false, baseUrl);
-                
+
                 if (newVideoUrl != null && !newVideoUrl.isBlank()) {
                     log.info("Tìm thấy video URL mới: {}", newVideoUrl);
                     return newVideoUrl;
                 }
             }
-            
+
             log.warn("Không tìm thấy video URL mới sau khi click button");
             return null;
-            
+
         } catch (Exception e) {
             log.error("Lỗi khi extract video URL từ page: {}", e.getMessage());
             return null;
@@ -1677,27 +1743,27 @@ public class CrawlSourceService {
             log.warn("Không có thumbnail URL để download");
             return null;
         }
-        
+
         try {
             // Tạo tên file và đường dẫn local
             String fileName = StringUtils.generateSlug(title) + "-thumb.jpg";
             String localPath = buildThumbnailLocalPath(title, isSeries);
-            
+
             // Download file
             downloadFile(originalUrl, localPath);
-            
+
             // Trả về link local để lưu vào database
             String playlistBaseUrl = m3u8Properties.getPlaylistBaseUrl();
-            String normalizedBase = playlistBaseUrl.endsWith("/") 
-                ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1) 
-                : playlistBaseUrl;
-            
+            String normalizedBase = playlistBaseUrl.endsWith("/")
+                    ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1)
+                    : playlistBaseUrl;
+
             String relativePath = localPath.replace("data/playlist/", "");
             String localUrl = normalizedBase + relativePath;
-            
+
             log.info("✅ Đã download và lưu thumbnail: {} -> {}", originalUrl, localUrl);
             return localUrl;
-            
+
         } catch (Exception e) {
             log.error("Lỗi khi download thumbnail: {}", e.getMessage());
             return originalUrl; // Fallback về URL gốc
@@ -1712,27 +1778,27 @@ public class CrawlSourceService {
             log.warn("Không có poster URL để download");
             return null;
         }
-        
+
         try {
             // Tạo tên file và đường dẫn local
             String fileName = StringUtils.generateSlug(title) + "-poster.jpg";
             String localPath = buildPosterLocalPath(title, isSeries);
-            
+
             // Download file
             downloadFile(originalUrl, localPath);
-            
+
             // Trả về link local để lưu vào database
             String playlistBaseUrl = m3u8Properties.getPlaylistBaseUrl();
-            String normalizedBase = playlistBaseUrl.endsWith("/") 
-                ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1) 
-                : playlistBaseUrl;
-            
+            String normalizedBase = playlistBaseUrl.endsWith("/")
+                    ? playlistBaseUrl.substring(0, playlistBaseUrl.length() - 1)
+                    : playlistBaseUrl;
+
             String relativePath = localPath.replace("data/playlist/", "");
             String localUrl = normalizedBase + relativePath;
-            
+
             log.info("✅ Đã download và lưu poster: {} -> {}", originalUrl, localUrl);
             return localUrl;
-            
+
         } catch (Exception e) {
             log.error("Lỗi khi download poster: {}", e.getMessage());
             return originalUrl; // Fallback về URL gốc
@@ -1768,29 +1834,27 @@ public class CrawlSourceService {
             if (!parentDir.exists()) {
                 parentDir.mkdirs();
             }
-            
+
             // Download file
             String encoded = java.net.URI.create(url).toASCIIString();
             URL fileUrl = new URL(encoded);
             try (InputStream in = fileUrl.openStream();
-                 FileOutputStream out = new FileOutputStream(localPath)) {
-                
+                    FileOutputStream out = new FileOutputStream(localPath)) {
+
                 byte[] buffer = new byte[1024];
                 int bytesRead;
                 while ((bytesRead = in.read(buffer)) != -1) {
                     out.write(buffer, 0, bytesRead);
                 }
             }
-            
+
             log.info("✅ Đã download file: {} -> {}", url, localPath);
-            
+
         } catch (Exception e) {
             log.error("Lỗi khi download file {}: {}", url, e.getMessage());
             throw e;
         }
     }
-
-
 
     // legacy helper removed; use m3U8DownloadService directly and build path via
     // buildMasterLocalPath
@@ -1835,7 +1899,7 @@ public class CrawlSourceService {
 
         try {
             // Lấy domain từ baseUrl
-            java.net.URI baseUri = new java.net.URI(baseUrl);
+            URI baseUri = new URI(baseUrl);
             String domain = baseUri.getScheme() + "://" + baseUri.getHost();
 
             // Nếu URL bắt đầu bằng /, thêm domain vào trước
@@ -1845,13 +1909,14 @@ public class CrawlSourceService {
 
             // Nếu URL không bắt đầu bằng /, thêm domain và / vào trước
             return domain + "/" + url;
-        } catch (java.net.URISyntaxException e) {
+        } catch (URISyntaxException e) {
             log.warn("Không thể parse baseUrl: {}", baseUrl);
             return url;
         }
     }
 
-    private void saveRelatedEntities(Movie movie, Map<String, String> extractedData, String baseUrl, Set<SelectorItem> selectorItems, WebDriver driver, Document currentDoc) {
+    private void saveRelatedEntities(Movie movie, Map<String, String> extractedData, String baseUrl,
+            Set<SelectorItem> selectorItems, WebDriver driver, Document currentDoc) {
         // Lưu Actors
         saveActors(movie, extractedData.get(SelectorMovieDetail.ACTORS.getValue()));
         // Lưu Categories
@@ -1865,9 +1930,11 @@ public class CrawlSourceService {
     }
 
     private SelectorItem getSelectorByName(Set<SelectorItem> selectorItems, String name) {
-        if (selectorItems == null || selectorItems.isEmpty() || name == null) return null;
+        if (selectorItems == null || selectorItems.isEmpty() || name == null)
+            return null;
         for (SelectorItem si : selectorItems) {
-            if (name.equals(si.getName())) return si;
+            if (name.equals(si.getName()))
+                return si;
         }
         return null;
     }
@@ -1879,7 +1946,8 @@ public class CrawlSourceService {
         options.addArguments("--disable-audio");
         options.addArguments("--disable-images");
         options.addArguments("--disable-blink-features=AutomationControlled");
-        options.addArguments("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        options.addArguments(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         options.addArguments("--disable-web-security");
         options.addArguments("--allow-running-insecure-content");
         options.addArguments("--disable-gpu");
@@ -1887,7 +1955,8 @@ public class CrawlSourceService {
         return new ChromeDriver(options);
     }
 
-    private void handleButtonClick(WebDriver driver, WebDriverWait wait, Movie movie, Set<SelectorItem> selectorItems, String serverType, String buttonQuery, String baseUrl) {
+    private void handleButtonClick(WebDriver driver, WebDriverWait wait, Movie movie, Set<SelectorItem> selectorItems,
+            String serverType, String buttonQuery, String baseUrl) {
         try {
             log.info("Đang xử lý {} button với selector: {}", serverType, buttonQuery);
 
@@ -1940,14 +2009,16 @@ public class CrawlSourceService {
         }
     }
 
-    private String extractVideoUrlFromPageAfterClick(WebDriver driver, String baseUrl, Set<SelectorItem> selectorItems) {
+    private String extractVideoUrlFromPageAfterClick(WebDriver driver, String baseUrl,
+            Set<SelectorItem> selectorItems) {
         try {
             String pageSource = driver.getPageSource();
             Document doc = Jsoup.parse(pageSource, baseUrl);
 
             SelectorItem videoSel = getSelectorByName(selectorItems, SelectorMovieDetail.VIDEO_URL.getValue());
             if (videoSel != null && videoSel.getQuery() != null && !videoSel.getQuery().isBlank()) {
-                String newVideoUrl = extractValueFromSelector(doc, videoSel.getQuery(), videoSel.getAttribute(), false, baseUrl);
+                String newVideoUrl = extractValueFromSelector(doc, videoSel.getQuery(), videoSel.getAttribute(), false,
+                        baseUrl);
                 if (newVideoUrl != null && !newVideoUrl.isBlank()) {
                     log.info("Tìm thấy video URL mới: {}", newVideoUrl);
                     return newVideoUrl;
@@ -1962,20 +2033,25 @@ public class CrawlSourceService {
     }
 
     // === Appended overloads for selector-based Selenium flow ===
-    private void saveEpisodesAndServerDatas(Movie movie, Map<String, String> extractedData, String baseUrl, Set<SelectorItem> selectorItems, WebDriver driver, Document currentDoc) {
-        // 1) Lấy videoUrl ban đầu từ DOM bằng selector VIDEO_URL; fallback về extractedData nếu cần
+    private void saveEpisodesAndServerDatas(Movie movie, Map<String, String> extractedData, String baseUrl,
+            Set<SelectorItem> selectorItems, WebDriver driver, Document currentDoc) {
+        // 1) Lấy videoUrl ban đầu từ DOM bằng selector VIDEO_URL; fallback về
+        // extractedData nếu cần
         String effectiveVideoUrl = null;
         SelectorItem videoSelector = getSelectorByName(selectorItems, SelectorMovieDetail.VIDEO_URL.getValue());
         if (videoSelector != null) {
             try {
-                effectiveVideoUrl = extractValueFromSelector(currentDoc, videoSelector.getQuery(), videoSelector.getAttribute(), false, baseUrl);
-            } catch (Exception ignore) {}
+                effectiveVideoUrl = extractValueFromSelector(currentDoc, videoSelector.getQuery(),
+                        videoSelector.getAttribute(), false, baseUrl);
+            } catch (Exception ignore) {
+            }
         }
         if ((effectiveVideoUrl == null || effectiveVideoUrl.isBlank())) {
             effectiveVideoUrl = extractedData.get(SelectorMovieDetail.VIDEO_URL.getValue());
         }
 
-        // 2) Quyết định có handle Selenium hay không dựa trên sự hiện diện trong extractedData
+        // 2) Quyết định có handle Selenium hay không dựa trên sự hiện diện trong
+        // extractedData
         String subtitlePresence = extractedData.get(SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
         String buddingPresence = extractedData.get(SelectorMovieDetail.BUDDING_BUTTON.getValue());
         boolean shouldHandle = (subtitlePresence != null && !subtitlePresence.isBlank())
@@ -1994,16 +2070,19 @@ public class CrawlSourceService {
         }
     }
 
-    private void handleSubtitleAndBuddhaButtons(Movie movie, Set<SelectorItem> selectorItems, String baseUrl, WebDriver driver) {
+    private void handleSubtitleAndBuddhaButtons(Movie movie, Set<SelectorItem> selectorItems, String baseUrl,
+            WebDriver driver) {
         try {
             WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
 
-            SelectorItem subtitleBtnSel = getSelectorByName(selectorItems, SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
+            SelectorItem subtitleBtnSel = getSelectorByName(selectorItems,
+                    SelectorMovieDetail.SUBTITLE_BUTTON.getValue());
             if (subtitleBtnSel != null && subtitleBtnSel.getQuery() != null && !subtitleBtnSel.getQuery().isBlank()) {
                 handleButtonClick(driver, wait, movie, selectorItems, "subtitle", subtitleBtnSel.getQuery(), baseUrl);
             }
 
-            SelectorItem buddingBtnSel = getSelectorByName(selectorItems, SelectorMovieDetail.BUDDING_BUTTON.getValue());
+            SelectorItem buddingBtnSel = getSelectorByName(selectorItems,
+                    SelectorMovieDetail.BUDDING_BUTTON.getValue());
             if (buddingBtnSel != null && buddingBtnSel.getQuery() != null && !buddingBtnSel.getQuery().isBlank()) {
                 handleButtonClick(driver, wait, movie, selectorItems, "budding", buddingBtnSel.getQuery(), baseUrl);
             }

@@ -8,14 +8,14 @@ spring:
     ansi:
       enabled: always
   datasource:
-    url: ${DBMS_CONNECTION:jdbc:mysql://localhost:3306/identity_service}
-    driverClassName: "com.mysql.cj.jdbc.Driver"
-    password: ${DBMS_PASSWORD:user123}
-    username: ${DBMS_USERNAME:myuser}
-#    url: ${DBMS_CONNECTION:jdbc:mysql://193.24.209.123:3306/be-tool-phim}
+#    url: ${DBMS_CONNECTION:jdbc:mysql://localhost:3306/identity_service}
 #    driverClassName: "com.mysql.cj.jdbc.Driver"
-#    password: ${DBMS_PASSWORD:TpfcsXTcZiZJtFbW}
-#    username: ${DBMS_USERNAME:be-tool-phim}
+#    password: ${DBMS_PASSWORD:user123}
+#    username: ${DBMS_USERNAME:myuser}
+      url: ${DBMS_CONNECTION:jdbc:mysql://193.24.209.123:3306/be-tool-phim}
+      driverClassName: "com.mysql.cj.jdbc.Driver"
+      password: ${DBMS_PASSWORD:TpfcsXTcZiZJtFbW}
+      username: ${DBMS_USERNAME:be-tool-phim}
   jpa:
     hibernate:
       ddl-auto: update

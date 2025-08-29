@@ -47,7 +47,7 @@ public class DownloadHelper {
      */
     public void downloadAndSaveFile(String fileUrl, String savePath) {
         try {
-            log.info("📥 Đang tải: {}", fileUrl);
+            log.debug("📥 Đang tải: {}", fileUrl);
 
             HttpHeaders headers = new HttpHeaders();
             headers.set("User-Agent", USER_AGENT);

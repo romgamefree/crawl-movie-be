@@ -4,10 +4,8 @@ import java.util.HashSet;
 import java.util.Set;
 
 import com.devteria.identityservice.constant.SelectorMovieDetail;
-import com.devteria.identityservice.entity.Selector;
-import com.devteria.identityservice.entity.SelectorItem;
-import com.devteria.identityservice.repository.SelectorItemRepository;
-import com.devteria.identityservice.repository.SelectorRepository;
+import com.devteria.identityservice.entity.*;
+import com.devteria.identityservice.repository.*;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -15,16 +13,14 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import com.devteria.identityservice.constant.PredefinedRole;
-import com.devteria.identityservice.entity.Role;
-import com.devteria.identityservice.entity.User;
-import com.devteria.identityservice.repository.RoleRepository;
-import com.devteria.identityservice.repository.UserRepository;
 
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
 import lombok.experimental.NonFinal;
 import lombok.extern.slf4j.Slf4j;
+
+import static com.devteria.identityservice.constant.AppConfigKeys.*;
 
 @Configuration
 @RequiredArgsConstructor
@@ -45,7 +41,11 @@ public class ApplicationInitConfig {
             prefix = "spring",
             value = "datasource.driverClassName",
             havingValue = "com.mysql.cj.jdbc.Driver")
-    ApplicationRunner applicationRunner(UserRepository userRepository, RoleRepository roleRepository, SelectorRepository selectorRepository, SelectorItemRepository selectorItemRepository) {
+    ApplicationRunner applicationRunner(UserRepository userRepository,
+                                        RoleRepository roleRepository,
+                                        SelectorRepository selectorRepository,
+                                        SelectorItemRepository selectorItemRepository,
+                                        ConfigRepository configRepository) {
         log.info("Initializing application.....");
         return args -> {
             if (userRepository.findByUsername(ADMIN_USER_NAME).isEmpty()) {
@@ -80,6 +80,36 @@ public class ApplicationInitConfig {
                         .name("123hd")
                         .note("system default selector")
                         .build());
+
+                if(configRepository.findAll().isEmpty()) {
+                    Config config123HdSitemapUrl = configRepository.save(Config.builder()
+                            .key(SITEMAP_URL_123HD)
+                            .value("https://www.123hdtv.com/wp-sitemap.xml")
+                            .type("string")
+                            .description("123hdtv sitemap url")
+                            .build());
+
+                    Config config123HdSelector = configRepository.save(Config.builder()
+                            .key(SELECTOR_123HD)
+                            .value(selector123Hd.getId().toString())
+                            .type("string")
+                            .description("123hdtv selector")
+                            .build());
+
+                    Config scheduleCrawl123HdSitemap = configRepository.save(Config.builder()
+                            .key(SCHEDULE_CRAWL_SITEMAP)
+                            .value("60")
+                            .type("long")
+                            .description("schedule crawl 123hdtv sitemap")
+                            .build());
+
+                    Config scheduleCrawl123HdMovie = configRepository.save(Config.builder()
+                            .key(SCHEDULE_CRAWL_MOVIE)
+                            .value("6000000")
+                            .type("long")
+                            .description("schedule crawl 123hdtv movie")
+                            .build());
+                }
 
                 // Sau đó tạo SelectorItem với reference đến Selector
                 SelectorItem descriptionSelector = selectorItemRepository.save(SelectorItem.builder()

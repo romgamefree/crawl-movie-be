@@ -4,6 +4,7 @@ import com.devteria.identityservice.entity.CrawlSource;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.data.domain.Pageable;
 
 import java.util.List;
 import java.util.Optional;
@@ -49,4 +50,10 @@ public interface CrawlSourceRepository extends JpaRepository<CrawlSource, String
     Set<String> findEnabledAndNotInsertedIds();
 
     Optional<CrawlSource> findFirstBySelectorId(String selectorId);
+
+    /**
+     * Lấy IDs theo checkpoint (lastId) và giới hạn bởi pageable (size)
+     */
+    @Query("SELECT cs.id FROM CrawlSource cs WHERE cs.enabled = true AND cs.inserted = false AND (:lastId IS NULL OR cs.id > :lastId) ORDER BY cs.id ASC")
+    List<String> findEnabledNotInsertedIdsAfter(@Param("lastId") String lastId, Pageable pageable);
 }

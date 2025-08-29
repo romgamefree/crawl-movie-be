@@ -30,8 +30,9 @@ public class M3U8DownloadService {
     private static final String FOLDER_SEGMENTS = "segments";
     private static final String FILE_MASTER_M3U8 = "master.m3u8";
     private static final String FILE_INDEX_M3U8 = "index.m3u8";
-    private static final int BATCH_SIZE = 10;
-    private static final int MAX_CONCURRENT_DOWNLOADS = 20;
+    private static final int BATCH_SIZE = 5;
+    private static final int MAX_CONCURRENT_DOWNLOADS = 8;
+    private static final long BATCH_DELAY_MS = 300L;
     private static final String MASTER_M3U8_URL_FORMAT_HOT_24HD = "https://hot.24playerhd.com/iosplaylist/%s/%s.m3u8";
     private static final String MASTER_M3U8_URL_FORMAT_MAIN_24HD = "https://main.24playerhd.com/newplaylist/%s/%s.m3u8";
 
@@ -141,12 +142,43 @@ public class M3U8DownloadService {
                         String savePath = segmentFolder + "/" + fileName;
 
                         return CompletableFuture.runAsync(() -> {
-                            downloadHelper.downloadAndSaveFile(segUrl, savePath);
+                            downloadSegmentWithRetry(segUrl, savePath);
                         }, executorService);
                     })
                     .collect(Collectors.toList());
 
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            // Nghỉ ngắn giữa các batch để tránh quá tải IO / network
+            try {
+                Thread.sleep(BATCH_DELAY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void downloadSegmentWithRetry(String segUrl, String savePath) {
+        final int maxRetries = 2;
+        long backoff = 300L;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                downloadHelper.downloadAndSaveFile(segUrl, savePath);
+                return;
+            } catch (Exception ex) {
+                if (attempt >= maxRetries) {
+                    log.warn("⚠️ Bỏ qua segment sau {} lần thử: {} - {}", attempt, segUrl, ex.getMessage());
+                    return; // Không ném lỗi để không làm hỏng cả batch
+                }
+                log.error("🔁 Lỗi tải segment (attempt {}), đợi {}ms rồi thử lại: {}", attempt, backoff, segUrl);
+                try {
+                    Thread.sleep(backoff);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                backoff *= 2;
+            }
         }
     }
 
