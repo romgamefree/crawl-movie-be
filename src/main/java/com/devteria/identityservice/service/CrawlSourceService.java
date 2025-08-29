@@ -240,6 +240,79 @@ public class CrawlSourceService {
     }
 
     /**
+     * Insert dữ liệu từ danh sách CrawlSource URLs cụ thể
+     */
+    @Transactional
+    public BulkInsertResponse insertFromCrawlSourceUrls(List<String> crawlSourceUrls, boolean force) {
+        long startTime = System.currentTimeMillis();
+        log.info("🚀 Bắt đầu insert từ {} crawl source URLs", crawlSourceUrls.size());
+
+        int successCount = 0;
+        int errorCount = 0;
+        int skippedCount = 0;
+        List<String> errorUrls = new ArrayList<>();
+        List<String> skippedUrls = new ArrayList<>();
+
+        for (int i = 0; i < crawlSourceUrls.size(); i++) {
+            String crawlSourceUrl = crawlSourceUrls.get(i);
+
+            try {
+                // Tìm crawl source theo URL
+                CrawlSource crawlSource = repository.findByBaseUrl(crawlSourceUrl)
+                        .orElseThrow(() -> new AppException(ErrorCode.DATA_NOT_FOUND));
+
+                if (!force && crawlSource.getInserted()) {
+                    skippedCount++;
+                    skippedUrls.add(crawlSource.getBaseUrl());
+                    log.info("⏭️ Bỏ qua crawl source đã được insert: {}", crawlSource.getBaseUrl());
+                    continue;
+                }
+
+                log.info("📝 Đang xử lý crawl source {}/{}: URL {}", i + 1, crawlSourceUrls.size(), crawlSourceUrl);
+
+                MovieResponse movieResponse = insertFromCrawlSource(crawlSource.getId(), force);
+                successCount++;
+
+                log.info("✅ Thành công: URL {} -> {}", crawlSourceUrl, movieResponse.getTitle());
+
+            } catch (Exception e) {
+                errorCount++;
+                errorUrls.add("URL: " + crawlSourceUrl + " - " + e.getMessage());
+                log.error("❌ Lỗi khi xử lý crawl source URL {}: {}", crawlSourceUrl, e.getMessage());
+            }
+
+            // Log progress mỗi 10 records
+            if ((i + 1) % 10 == 0) {
+                log.info("📊 Tiến độ: {}/{} (thành công: {}, lỗi: {}, bỏ qua: {})",
+                        i + 1, crawlSourceUrls.size(), successCount, errorCount, skippedCount);
+            }
+        }
+
+        long processingTime = System.currentTimeMillis() - startTime;
+
+        log.info("🎉 Hoàn thành! Tổng kết: {}/{} thành công, {} lỗi, {} bỏ qua trong {}ms",
+                successCount, crawlSourceUrls.size(), errorCount, skippedCount, processingTime);
+
+        if (!errorUrls.isEmpty()) {
+            log.warn("⚠️ Các crawl source bị lỗi: {}", errorUrls);
+        }
+
+        if (!skippedUrls.isEmpty()) {
+            log.info("ℹ️ Các crawl source đã được insert trước đó: {}", skippedUrls);
+        }
+
+        return BulkInsertResponse.builder()
+                .totalSources(crawlSourceUrls.size())
+                .successCount(successCount)
+                .errorCount(errorCount)
+                .errorUrls(errorUrls)
+                .message(String.format("Đã xử lý %d crawl sources: %d thành công, %d lỗi, %d bỏ qua trong %dms",
+                        crawlSourceUrls.size(), successCount, errorCount, skippedCount, processingTime))
+                .processingTimeMs(processingTime)
+                .build();
+    }
+
+    /**
      * Insert dữ liệu từ danh sách CrawlSource IDs cụ thể (chỉ những cái chưa được
      * insert)
      * 
@@ -317,8 +390,7 @@ public class CrawlSourceService {
     }
 
     /**
-     * Insert tất cả movies từ các crawl sources có enabled = true và inserted =
-     * false
+     * Insert tất cả movies từ các crawl sources có enabled = true và inserted = false
      * 
      * @return Thông tin chi tiết về quá trình insert
      */

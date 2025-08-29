@@ -54,10 +54,10 @@ public class CrawlSourceController {
                 .result(sitemapCrawlerService.crawl123HdSitemapWithSelector(request)).build();
     }
 
-    @PostMapping("/insert-movies-by-ids")
-    ApiResponse<BulkInsertResponse> insertMoviesFromCrawlSourceIds(@RequestBody List<String> crawlSourceIds) {
+    @PostMapping("/insert-movies-by-urls")
+    ApiResponse<BulkInsertResponse> insertMoviesFromCrawlSourceUrls(@RequestBody List<String> crawlSourceUrls) {
         // Yêu cầu: API này phải chạy lại ngay cả khi đã inserted (force = true)
-        BulkInsertResponse response = service.insertFromCrawlSourceIds(crawlSourceIds, true);
+        BulkInsertResponse response = service.insertFromCrawlSourceUrls(crawlSourceUrls, true);
         return ApiResponse.<BulkInsertResponse>builder().result(response).build();
     }
 

@@ -16,6 +16,11 @@ public interface CrawlSourceRepository extends JpaRepository<CrawlSource, String
     boolean existsByBaseUrl(String baseUrl);
 
     /**
+     * Find a crawl source by its base URL
+     */
+    Optional<CrawlSource> findByBaseUrl(String baseUrl);
+
+    /**
      * Tìm tất cả crawl sources được enabled
      */
     List<CrawlSource> findByEnabledTrue();
